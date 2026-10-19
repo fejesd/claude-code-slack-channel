@@ -58,6 +58,7 @@ import {
   recordApprovalVote,
   recordOwnPostTs,
   resolveJournalPath,
+  SOCKET_MODE_CLIENT_OPTIONS,
   sanitizeDisplayName,
   sanitizeFilename,
   validateSendableRoots,
@@ -210,7 +211,7 @@ const { botToken, appToken } = loadEnv()
 // ---------------------------------------------------------------------------
 
 const web = new WebClient(botToken)
-const socket = new SocketModeClient({ appToken })
+const socket = new SocketModeClient({ appToken, clientOptions: SOCKET_MODE_CLIENT_OPTIONS })
 
 let botUserId = ''
 let selfBotId = ''

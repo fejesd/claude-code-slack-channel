@@ -54,6 +54,7 @@ import {
   resolveJournalPath,
   type Session,
   type SessionKey,
+  SOCKET_MODE_CLIENT_OPTIONS,
   sanitizeDisplayName,
   sanitizeFilename,
   saveOwnThreads,
@@ -1956,6 +1957,25 @@ describe('@slack/socket-mode contract used by the heartbeat', () => {
     expect(seen).toEqual([])
     // cancel the scheduled library reconnect: disconnect() sets shuttingDown
     await client.disconnect()
+  })
+
+  test('the client keeps our bounded retry policy (the library only defaults it when unset)', async () => {
+    const { SocketModeClient } = await import('@slack/socket-mode')
+    const client = new SocketModeClient({
+      appToken: 'xapp-test',
+      clientOptions: SOCKET_MODE_CLIENT_OPTIONS,
+    })
+    const web = (
+      client as unknown as {
+        webClient: { retryConfig: unknown; axios: { defaults: { timeout: number } } }
+      }
+    ).webClient
+    expect(web.retryConfig).toEqual({ retries: 100, factor: 1.3, maxTimeout: 30_000 })
+    expect(web.axios.defaults.timeout).toBe(10_000)
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    expect(src).toContain(
+      'new SocketModeClient({ appToken, clientOptions: SOCKET_MODE_CLIENT_OPTIONS })',
+    )
   })
 
   test('server.ts wires the heartbeat to connected / close / disconnected / ws_message', () => {

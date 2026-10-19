@@ -1360,6 +1360,16 @@ export const WS_DOWN_RECONNECT_MS = 120_000
 /** Still down this long: exit non-zero so the session gets restarted. */
 export const WS_DOWN_EXIT_MS = 240_000
 
+/** Options for the Socket Mode client's own WebClient (apps.connections.open).
+ *  The library default is 100 retries, factor 1.3, no maxTimeout and no request
+ *  timeout: after ~20 failed attempts the next wait is minutes, after ~30 it is
+ *  most of an hour, and one hung request never returns. Its reconnect then looks
+ *  alive while it sleeps -- the likely shape of the 2026-10-19 deaf plugin. */
+export const SOCKET_MODE_CLIENT_OPTIONS = {
+  timeout: 10_000,
+  retryConfig: { retries: 100, factor: 1.3, maxTimeout: 30_000 },
+}
+
 export interface WsHeartbeat {
   setConnected(up: boolean): void
   sawEvent(): void
