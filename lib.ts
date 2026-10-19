@@ -1370,6 +1370,15 @@ export const SOCKET_MODE_CLIENT_OPTIONS = {
   retryConfig: { retries: 100, factor: 1.3, maxTimeout: 30_000 },
 }
 
+/** True if the client's CURRENT websocket is open. A `close` can come from an
+ *  orphaned socket (a forced start() racing the library's own pending
+ *  reconnect leaves the older one alive), and must not mark a live newer
+ *  connection down. `websocket` is internal to @slack/socket-mode (pinned). */
+export function currentWsActive(client: unknown): boolean {
+  const ws = (client as { websocket?: { isActive?: () => boolean } }).websocket
+  return ws?.isActive?.() === true
+}
+
 export interface WsHeartbeat {
   setConnected(up: boolean): void
   sawEvent(): void

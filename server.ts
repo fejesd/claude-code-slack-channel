@@ -32,6 +32,7 @@ import {
   buildAndPostAuditReceipt,
   chunkText,
   createWsHeartbeat,
+  currentWsActive,
   decidePermissionRoute,
   defaultAccess,
   detectNewAllowFrom,
@@ -2830,6 +2831,8 @@ async function main(): Promise<void> {
     // Accepted risk: start() clears the client's shuttingDown flag at once, so
     // a library reconnect still pending (retry timer, or apps.connections.open
     // in its backoff) is not cancelled and may later open a second websocket.
+    // The older one is then orphaned but stays open; its eventual `close` is
+    // ignored while the current socket is active (currentWsActive).
     // If a pending library start() is waiting for `hello`, the disconnect()
     // rejects it unhandled and the process exits 1 -- the restart path anyway.
     reconnect: () => {
@@ -2843,7 +2846,7 @@ async function main(): Promise<void> {
     exit: (reason) => void shutdown(reason, 1),
   })
   socket.on('connected', () => heartbeat.setConnected(true))
-  socket.on('close', () => heartbeat.setConnected(false))
+  socket.on('close', () => heartbeat.setConnected(currentWsActive(socket)))
   socket.on('disconnected', () => heartbeat.setConnected(false))
   socket.on('ws_message', () => heartbeat.sawEvent())
   heartbeat.tick()

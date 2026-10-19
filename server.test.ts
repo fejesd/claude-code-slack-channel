@@ -28,6 +28,7 @@ import {
   type ChannelPolicy,
   chunkText,
   createWsHeartbeat,
+  currentWsActive,
   defaultAccess,
   detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
@@ -1978,10 +1979,57 @@ describe('@slack/socket-mode contract used by the heartbeat', () => {
     )
   })
 
+  // After a forced start() races the library's own pending reconnect, two
+  // websockets can be open and the older one is orphaned. Its eventual close
+  // must not mark the live current connection down. (That at most ONE socket
+  // stays open cannot be guaranteed from outside the library: closing the
+  // orphan emits `close`, which the library answers with yet another start().)
+  test('a close from an orphaned socket keeps ws_connected while the current one is open', async () => {
+    const { SocketModeClient } = await import('@slack/socket-mode')
+    const { SlackWebSocket } = await import('@slack/socket-mode/dist/src/SlackWebSocket.js')
+    // autoReconnect off: the library must not dial Slack from a unit test
+    const client = new SocketModeClient({ appToken: 'xapp-test', autoReconnectEnabled: false })
+    const dir = mkdtempSync(join(tmpdir(), 'ws-orphan-'))
+    try {
+      const file = join(dir, 'heartbeat.json')
+      const hb = createWsHeartbeat({
+        file,
+        now: Date.now,
+        lastPongAt: () => null,
+        reconnect: () => {},
+        exit: () => {},
+      })
+      client.on('close', () => hb.setConnected(currentWsActive(client)))
+      const open = () => ({ readyState: 1, removeAllListeners() {}, terminate() {} })
+      const mk = () => {
+        const w = new SlackWebSocket({
+          url: 'wss://invalid.example',
+          client: client as never,
+          serverPingTimeoutMS: 30_000,
+          clientPingTimeoutMS: 5_000,
+        })
+        ;(w as unknown as { websocket: unknown }).websocket = open()
+        return w as unknown as { terminate(): void }
+      }
+      const orphan = mk()
+      const current = mk()
+      ;(client as unknown as { websocket: unknown }).websocket = current
+      hb.setConnected(true)
+      orphan.terminate()
+      expect(JSON.parse(readFileSync(file, 'utf-8')).ws_connected).toBe(true)
+      current.terminate()
+      expect(JSON.parse(readFileSync(file, 'utf-8')).ws_connected).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test('server.ts wires the heartbeat to connected / close / disconnected / ws_message', () => {
     const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
     expect(src).toContain("socket.on('connected', () => heartbeat.setConnected(true))")
-    expect(src).toContain("socket.on('close', () => heartbeat.setConnected(false))")
+    expect(src).toContain(
+      "socket.on('close', () => heartbeat.setConnected(currentWsActive(socket)))",
+    )
     expect(src).toContain("socket.on('disconnected', () => heartbeat.setConnected(false))")
     expect(src).toContain("socket.on('ws_message', () => heartbeat.sawEvent())")
     // registered before the first connect, or the first `connected` is missed
