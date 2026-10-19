@@ -27,6 +27,7 @@ import {
   buildAuditReceiptMessage,
   type ChannelPolicy,
   chunkText,
+  createWsHeartbeat,
   defaultAccess,
   detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
@@ -60,6 +61,9 @@ import {
   sessionPath,
   shouldPostAuditReceipt,
   validateSendableRoots,
+  WS_DOWN_EXIT_MS,
+  WS_DOWN_RECONNECT_MS,
+  writeFileAtomicSync,
 } from './lib.ts'
 import { createSessionSupervisor } from './supervisor.ts'
 
@@ -1711,6 +1715,257 @@ describe('loadOwnThreads / saveOwnThreads / recordOwnPostTs', () => {
     const loaded = loadOwnThreads(file)
     expect(loaded.size).toBe(2)
     expect(existsSync(`${file}.tmp.${process.pid}`)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// writeFileAtomicSync() / createWsHeartbeat()
+// ---------------------------------------------------------------------------
+
+describe('writeFileAtomicSync', () => {
+  let tmpDir: string
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'atomic-'))
+  })
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  test('replaces the file, mode 0o600, no tmp left behind', () => {
+    const file = join(tmpDir, 'f.json')
+    writeFileSync(file, 'old')
+    writeFileAtomicSync(file, 'new')
+    expect(readFileSync(file, 'utf-8')).toBe('new')
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+    expect(readdirSync(tmpDir)).toEqual(['f.json'])
+  })
+
+  test('removes a stale tmp from a crashed run instead of failing on wx', () => {
+    const file = join(tmpDir, 'f.json')
+    writeFileSync(`${file}.tmp.${process.pid}`, 'stale')
+    writeFileAtomicSync(file, 'x')
+    expect(readFileSync(file, 'utf-8')).toBe('x')
+    expect(readdirSync(tmpDir)).toEqual(['f.json'])
+  })
+
+  test('throws and leaves no tmp when the target dir is missing', () => {
+    const file = join(tmpDir, 'missing', 'f.json')
+    expect(() => writeFileAtomicSync(file, 'x')).toThrow()
+    expect(readdirSync(tmpDir)).toEqual([])
+  })
+})
+
+describe('createWsHeartbeat', () => {
+  let tmpDir: string
+  let file: string
+  let clock: number
+  let pong: number | null
+  let reconnects: number
+  let exits: string[]
+  const T0 = 1_800_000_000_000
+
+  function make() {
+    return createWsHeartbeat({
+      file,
+      now: () => clock,
+      lastPongAt: () => pong,
+      reconnect: () => {
+        reconnects++
+      },
+      exit: (reason) => {
+        exits.push(reason)
+      },
+    })
+  }
+  const read = () => JSON.parse(readFileSync(file, 'utf-8'))
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'ws-hb-'))
+    file = join(tmpDir, 'heartbeat.json')
+    clock = T0
+    pong = null
+    reconnects = 0
+    exits = []
+  })
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  test('tick writes exactly the documented fields, one compact line, seconds', () => {
+    const hb = make()
+    hb.tick()
+    const raw = readFileSync(file, 'utf-8')
+    // the watchdog parses this with sed: one line, no spaces after ':'
+    expect(raw).toBe(
+      `{"pid":${process.pid},"ws_connected":false,"last_ws_event_at":null,"last_pong_at":null,"written_at":${T0 / 1000}}\n`,
+    )
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+    expect(readdirSync(tmpDir)).toEqual(['heartbeat.json'])
+  })
+
+  test('ws_connected follows connected / close events', () => {
+    const hb = make()
+    hb.setConnected(true)
+    hb.tick()
+    expect(read().ws_connected).toBe(true)
+    hb.setConnected(false)
+    hb.tick()
+    expect(read().ws_connected).toBe(false)
+    hb.setConnected(true)
+    hb.tick()
+    expect(read().ws_connected).toBe(true)
+  })
+
+  test('last_ws_event_at and last_pong_at are reported in unix seconds', () => {
+    const hb = make()
+    clock = T0 + 12_345
+    hb.sawEvent()
+    pong = T0 + 20_999
+    clock = T0 + 30_000
+    hb.tick()
+    const j = read()
+    expect(j.last_ws_event_at).toBe(T0 / 1000 + 12)
+    expect(j.last_pong_at).toBe(T0 / 1000 + 20)
+    expect(j.written_at).toBe(T0 / 1000 + 30)
+  })
+
+  test('written_at advances on every tick', () => {
+    const hb = make()
+    hb.tick()
+    clock += 30_000
+    hb.tick()
+    expect(read().written_at).toBe(T0 / 1000 + 30)
+  })
+
+  test('a boot that never connects counts as down from creation', () => {
+    const hb = make()
+    clock += WS_DOWN_RECONNECT_MS
+    hb.tick()
+    expect(reconnects).toBe(1)
+    clock += WS_DOWN_EXIT_MS - WS_DOWN_RECONNECT_MS
+    hb.tick()
+    expect(exits.length).toBe(1)
+  })
+
+  test('connect / disconnect edges are written at once, not on the next tick', () => {
+    const hb = make()
+    clock += 5_000
+    hb.setConnected(true)
+    expect(read()).toMatchObject({ ws_connected: true, written_at: T0 / 1000 + 5 })
+    clock += 5_000
+    hb.setConnected(false)
+    expect(read()).toMatchObject({ ws_connected: false, written_at: T0 / 1000 + 10 })
+  })
+
+  test('forces exactly one reconnect once down >= WS_DOWN_RECONNECT_MS', () => {
+    const hb = make()
+    hb.setConnected(true)
+    hb.setConnected(false)
+    clock += WS_DOWN_RECONNECT_MS - 1
+    hb.tick()
+    expect(reconnects).toBe(0)
+    clock += 1
+    hb.tick()
+    expect(reconnects).toBe(1)
+    clock += 30_000
+    hb.tick()
+    expect(reconnects).toBe(1)
+    expect(exits).toEqual([])
+  })
+
+  test('repeated down events do not restart the down clock', () => {
+    const hb = make()
+    hb.setConnected(true)
+    hb.setConnected(false) // close
+    clock += 60_000
+    hb.setConnected(false) // disconnected after our own forced disconnect, etc.
+    clock += WS_DOWN_RECONNECT_MS - 60_000
+    hb.tick()
+    expect(reconnects).toBe(1)
+  })
+
+  test('exits once down >= WS_DOWN_EXIT_MS, not before', () => {
+    const hb = make()
+    hb.setConnected(true)
+    hb.setConnected(false)
+    clock += WS_DOWN_EXIT_MS - 1
+    hb.tick()
+    expect(exits).toEqual([])
+    clock += 1
+    hb.tick()
+    expect(exits.length).toBe(1)
+    expect(exits[0]).toContain(`${WS_DOWN_EXIT_MS / 1000}s`)
+  })
+
+  test('recovery resets the clock and re-arms the forced reconnect', () => {
+    const hb = make()
+    hb.setConnected(true)
+    hb.setConnected(false)
+    clock += WS_DOWN_RECONNECT_MS
+    hb.tick()
+    expect(reconnects).toBe(1)
+    hb.setConnected(true)
+    clock += WS_DOWN_EXIT_MS
+    hb.tick()
+    expect(exits).toEqual([])
+    hb.setConnected(false)
+    clock += WS_DOWN_RECONNECT_MS
+    hb.tick()
+    expect(reconnects).toBe(2)
+    expect(exits).toEqual([])
+  })
+
+  test('a failed heartbeat write does not stop the reconnect / exit path', () => {
+    file = join(tmpDir, 'gone', 'heartbeat.json')
+    const hb = make()
+    hb.setConnected(true)
+    hb.setConnected(false)
+    clock += WS_DOWN_RECONNECT_MS
+    hb.tick()
+    expect(reconnects).toBe(1)
+    clock += WS_DOWN_EXIT_MS
+    hb.tick()
+    expect(exits.length).toBe(1)
+  })
+})
+
+// The plugin's ws_connected relies on two @slack/socket-mode behaviours that
+// are not documented API. Pin them so a dependency bump that changes them
+// fails here instead of silently breaking the watchdog signal.
+describe('@slack/socket-mode contract used by the heartbeat', () => {
+  test('SlackWebSocket.terminate() emits `close` on the owning client', async () => {
+    const { SlackWebSocket } = await import('@slack/socket-mode/dist/src/SlackWebSocket.js')
+    const events: string[] = []
+    const client = { emit: (e: string) => events.push(e) }
+    const ws = new SlackWebSocket({
+      url: 'wss://invalid.example',
+      client: client as never,
+      serverPingTimeoutMS: 30_000,
+      clientPingTimeoutMS: 5_000,
+    })
+    ;(ws as unknown as { terminate(): void }).terminate()
+    expect(events).toEqual(['close'])
+  })
+
+  test('with autoReconnect a `close` does NOT emit `disconnected` (so close must be watched)', async () => {
+    const { SocketModeClient } = await import('@slack/socket-mode')
+    const client = new SocketModeClient({ appToken: 'xapp-test', logLevel: 'error' as never })
+    const seen: string[] = []
+    client.on('disconnected', () => seen.push('disconnected'))
+    client.emit('close')
+    expect(seen).toEqual([])
+    // cancel the scheduled library reconnect: disconnect() sets shuttingDown
+    await client.disconnect()
+  })
+
+  test('server.ts wires the heartbeat to connected / close / disconnected / ws_message', () => {
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    expect(src).toContain("socket.on('connected', () => heartbeat.setConnected(true))")
+    expect(src).toContain("socket.on('close', () => heartbeat.setConnected(false))")
+    expect(src).toContain("socket.on('disconnected', () => heartbeat.setConnected(false))")
+    expect(src).toContain("socket.on('ws_message', () => heartbeat.sawEvent())")
+    // registered before the first connect, or the first `connected` is missed
+    expect(src.indexOf("socket.on('connected'")).toBeLessThan(src.indexOf('await socket.start()'))
   })
 })
 

@@ -1314,13 +1314,19 @@ export function saveOwnThreads(filePath: string, timestamps: ReadonlySet<string>
     entries.push({ ts, createdAt: known.get(ts) ?? now })
   }
   const pruned = entries.filter((e) => now - e.createdAt < OWN_THREADS_TTL_MS)
-  const json = `${JSON.stringify(pruned, null, 2)}\n`
+  writeFileAtomicSync(filePath, `${JSON.stringify(pruned, null, 2)}\n`)
+}
+
+/** Crash-safe sync write: PID-scoped tmp (0o600, `wx`), chmod, rename. A
+ *  reader never sees a partial file; on error the tmp is removed and the
+ *  error re-thrown. */
+export function writeFileAtomicSync(filePath: string, data: string): void {
   const tmp = `${filePath}.tmp.${process.pid}`
   try {
     unlinkSync(tmp)
   } catch {}
   try {
-    writeFileSync(tmp, json, { mode: 0o600, flag: 'wx' })
+    writeFileSync(tmp, data, { mode: 0o600, flag: 'wx' })
     chmodSync(tmp, 0o600)
     renameSync(tmp, filePath)
   } catch (err) {
@@ -1334,6 +1340,89 @@ export function saveOwnThreads(filePath: string, timestamps: ReadonlySet<string>
 export function recordOwnPostTs(timestamps: Set<string>, ts: string, filePath: string): void {
   timestamps.add(ts)
   saveOwnThreads(filePath, timestamps)
+}
+
+// ---------------------------------------------------------------------------
+// Socket Mode liveness heartbeat
+// ---------------------------------------------------------------------------
+//
+// The plugin reports its own liveness in <STATE_DIR>/heartbeat.json so an
+// external watchdog (marveen scripts/channels.sh) only has to check freshness.
+// A live process is not enough: with @slack/socket-mode 2.0.6 the client's own
+// reconnect retries apps.connections.open 100 times with factor 1.3, no
+// maxTimeout and no request timeout, so it can sleep for tens of minutes (or
+// hang on one request) with no websocket, while outbound Web API calls keep
+// working. ws_connected therefore follows the client's own events.
+
+export const WS_HEARTBEAT_INTERVAL_MS = 30_000
+/** Down this long (and the client has not recovered by itself): force a reconnect. */
+export const WS_DOWN_RECONNECT_MS = 120_000
+/** Still down this long: exit non-zero so the session gets restarted. */
+export const WS_DOWN_EXIT_MS = 240_000
+
+export interface WsHeartbeat {
+  setConnected(up: boolean): void
+  sawEvent(): void
+  tick(): void
+}
+
+export function createWsHeartbeat(deps: {
+  file: string
+  now: () => number
+  lastPongAt: () => number | null
+  reconnect: () => void
+  exit: (reason: string) => void
+}): WsHeartbeat {
+  let connected = false
+  // The clock runs from creation: a boot that never gets `hello` is down too.
+  let downSince: number | null = deps.now()
+  let lastEventAt: number | null = null
+  let forced = false
+  const sec = (ms: number | null) => (ms === null ? null : Math.floor(ms / 1000))
+
+  function write(now: number): void {
+    try {
+      writeFileAtomicSync(
+        deps.file,
+        `${JSON.stringify({
+          pid: process.pid,
+          ws_connected: connected,
+          last_ws_event_at: sec(lastEventAt),
+          last_pong_at: sec(deps.lastPongAt()),
+          written_at: sec(now),
+        })}\n`,
+      )
+    } catch (err) {
+      // keep self-healing even when the file cannot be written
+      console.error('[slack] heartbeat write failed:', err)
+    }
+  }
+
+  return {
+    setConnected(up) {
+      if (up === connected) return
+      connected = up
+      downSince = up ? null : deps.now()
+      if (up) forced = false
+      // publish edges at once, not on the next 30 s tick
+      write(deps.now())
+    },
+    sawEvent() {
+      lastEventAt = deps.now()
+    },
+    tick() {
+      const now = deps.now()
+      write(now)
+      if (downSince === null) return
+      const down = now - downSince
+      if (down >= WS_DOWN_EXIT_MS) {
+        deps.exit(`websocket down for ${Math.round(down / 1000)}s`)
+      } else if (down >= WS_DOWN_RECONNECT_MS && !forced) {
+        forced = true
+        deps.reconnect()
+      }
+    },
+  }
 }
 
 // ---------------------------------------------------------------------------

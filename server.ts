@@ -31,6 +31,7 @@ import {
   assertPublishAllowed,
   buildAndPostAuditReceipt,
   chunkText,
+  createWsHeartbeat,
   decidePermissionRoute,
   defaultAccess,
   detectNewAllowFrom,
@@ -60,6 +61,7 @@ import {
   sanitizeDisplayName,
   sanitizeFilename,
   validateSendableRoots,
+  WS_HEARTBEAT_INTERVAL_MS,
 } from './lib.ts'
 import {
   assertPublishSizeAndSerialize,
@@ -550,6 +552,9 @@ let supervisor: SessionSupervisor | null = null
 /** Interval handle for the idle reaper tick. Stored so it can be cleared
  *  before supervisor.shutdown() during graceful exit. */
 let reaperTimer: ReturnType<typeof setInterval> | null = null
+
+/** Interval handle for the heartbeat.json writer (see createWsHeartbeat). */
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null
 
 // Track last active channel/thread for permission relay
 let lastActiveChannel = ''
@@ -2669,6 +2674,10 @@ async function shutdown(reason: string, code = 0): Promise<void> {
     clearInterval(reaperTimer)
     reaperTimer = null
   }
+  if (heartbeatTimer !== null) {
+    clearInterval(heartbeatTimer)
+    heartbeatTimer = null
+  }
 
   // Drain in-flight session writes before exiting. This ensures that any
   // handle.update() in progress completes its atomic save rather than
@@ -2805,6 +2814,40 @@ async function main(): Promise<void> {
   } catch (err) {
     console.error('[slack] Failed to resolve bot identity:', err)
   }
+
+  // Liveness heartbeat for the external watchdog. Registered before start()
+  // so the first `connected` is seen. `close` is needed because with
+  // autoReconnect the client never emits `disconnected` when the ws drops.
+  // lastPongReceivedTimestamp is internal to @slack/socket-mode (pinned);
+  // informational only, null if it ever moves.
+  const heartbeat = createWsHeartbeat({
+    file: join(STATE_DIR, 'heartbeat.json'),
+    now: Date.now,
+    lastPongAt: () =>
+      (socket as unknown as { websocket?: { lastPongReceivedTimestamp?: number } }).websocket
+        ?.lastPongReceivedTimestamp ?? null,
+    // Accepted risk: start() clears the client's shuttingDown flag at once, so
+    // a library reconnect still pending (retry timer, or apps.connections.open
+    // in its backoff) is not cancelled and may later open a second websocket.
+    // If a pending library start() is waiting for `hello`, the disconnect()
+    // rejects it unhandled and the process exits 1 -- the restart path anyway.
+    reconnect: () => {
+      console.error('[slack] websocket down too long, forcing a reconnect')
+      void socket
+        .disconnect()
+        .catch(() => {})
+        .then(() => socket.start())
+        .catch((err) => console.error('[slack] forced reconnect failed:', err))
+    },
+    exit: (reason) => void shutdown(reason, 1),
+  })
+  socket.on('connected', () => heartbeat.setConnected(true))
+  socket.on('close', () => heartbeat.setConnected(false))
+  socket.on('disconnected', () => heartbeat.setConnected(false))
+  socket.on('ws_message', () => heartbeat.sawEvent())
+  heartbeat.tick()
+  heartbeatTimer = setInterval(() => heartbeat.tick(), WS_HEARTBEAT_INTERVAL_MS)
+  heartbeatTimer.unref()
 
   // Connect Socket Mode (Slack ↔ local WebSocket)
   await socket.start()
